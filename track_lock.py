@@ -78,8 +78,11 @@ def video_display(uav_id, camera_url, shared_array, lock):
     cv2.destroyWindow(window_name)
     process.terminate()
 
-# ====================== odom回调 ======================
-def odom_global_callback(msg, uav_state, uav_id):
+# ====================== ✅ 修复：odom回调函数参数解包 ======================
+def odom_global_callback(msg, args):
+    # 关键修复：先解包元组参数
+    uav_state, uav_id = args
+    
     uav_state.drone_global_x = msg.pose.pose.position.x
     uav_state.drone_global_y = msg.pose.pose.position.y
     uav_state.drone_global_z = msg.pose.pose.position.z
@@ -94,7 +97,7 @@ def odom_global_callback(msg, uav_state, uav_id):
     qz = msg.pose.pose.orientation.z
     uav_state.drone_global_yaw = np.arctan2(2*(qw*qz + qx*qy), 1-2*(qy*qy + qz*qz))
 
-# ====================== 二维码检测函数（核心修正：多二维码支持） ======================
+# ====================== 二维码检测函数 ======================
 def qr_code_detection(uav_id, uav_state, shared_array, lock):
     # ---------------------- 下视相机核心参数 ----------------------
     W_img = 640
@@ -113,7 +116,7 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
     # YOLO模型
     model = torch.hub.load('/home/lvshunyao/桌面/yolov5', 'custom', path='/home/lvshunyao/桌面/best.pt', source='local')
     model.conf = 0.7
-    model.iou = 0.4  # ✅ 降低NMS阈值，避免相近二维码被过滤
+    model.iou = 0.4  # 降低NMS阈值，避免相近二维码被过滤
     
     target_locked = False
     target_box = None
@@ -131,7 +134,7 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
         detections = results.pred[0]
         detections = detections[detections[:, 4] >= 0.7]
         
-        # ✅ 修正1：多二维码画框（不同颜色+编号，避免重叠）
+        # 多二维码画框（不同颜色+编号，避免重叠）
         all_qr_data = []  # 存储所有二维码的坐标数据
         for idx, (*xyxy, conf, cls) in enumerate(detections):
             x1, y1, x2, y2 = map(int, xyxy)
@@ -214,7 +217,7 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
                 uav_state.exec_state = 1
                 print(f"[UAV{uav_id}] 下视追踪：重新锁定目标QR1")
         
-        # ✅ 修正2：发布所有二维码的坐标（遍历所有检测到的二维码）
+        # 发布所有二维码的坐标
         qr_global_poses = PoseArray()
         qr_global_poses.header.stamp = rospy.Time.now()
         qr_global_poses.header.frame_id = "map"
@@ -245,7 +248,7 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
         qr_poses_pub.publish(qr_global_poses)
         qr_ids_pub.publish(qr_ids)
         
-        # ✅ 修正3：打印所有二维码的坐标（每2秒一次，避免刷屏）
+        # 打印所有二维码的坐标（每2秒一次，避免刷屏）
         if len(detections) > 0 and rospy.Time.now().to_sec() % 2 < 0.1:
             print(f"\n[UAV{uav_id}] ======================================")
             print(f"检测到 {len(detections)} 个二维码：")
@@ -265,6 +268,7 @@ def run_single_uav(uav_id, camera_url):
     uav_state = UAVState()
     
     odom_topic = f'/odom_global_{uav_id:03d}'
+    # ✅ 这里保持不变，参数会被打包成元组传递给回调函数
     rospy.Subscriber(odom_topic, Odometry, odom_global_callback, callback_args=(uav_state, uav_id))
     print(f"[UAV{uav_id}] 订阅odom话题: {odom_topic}")
     print(f"[UAV{uav_id}] 下视相机流地址: {camera_url}")
