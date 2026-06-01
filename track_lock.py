@@ -5,7 +5,6 @@ import cv2
 import numpy as np
 import subprocess
 import multiprocessing as mp
-import threading
 import rospy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseArray, Pose
@@ -79,7 +78,7 @@ def video_display(uav_id, camera_url, shared_array, lock):
     cv2.destroyWindow(window_name)
     process.terminate()
 
-# ====================== odom回调（仅用于有定位的情况，无定位时不影响） ======================
+# ====================== odom回调 ======================
 def odom_global_callback(msg, uav_state, uav_id):
     uav_state.drone_global_x = msg.pose.pose.position.x
     uav_state.drone_global_y = msg.pose.pose.position.y
@@ -95,9 +94,9 @@ def odom_global_callback(msg, uav_state, uav_id):
     qz = msg.pose.pose.orientation.z
     uav_state.drone_global_yaw = np.arctan2(2*(qw*qz + qx*qy), 1-2*(qy*qy + qz*qz))
 
-# ====================== 二维码检测函数（核心修正：纯视觉计算相对坐标） ======================
+# ====================== 二维码检测函数（核心修正：多二维码支持） ======================
 def qr_code_detection(uav_id, uav_state, shared_array, lock):
-    # ---------------------- 下视相机核心参数（根据你的实际情况调整） ----------------------
+    # ---------------------- 下视相机核心参数 ----------------------
     W_img = 640
     H_img = 480
     FOV_x = 90.0   # 你的下视相机水平视场角
@@ -114,7 +113,7 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
     # YOLO模型
     model = torch.hub.load('/home/lvshunyao/桌面/yolov5', 'custom', path='/home/lvshunyao/桌面/best.pt', source='local')
     model.conf = 0.7
-    model.iou = 0.5
+    model.iou = 0.4  # ✅ 降低NMS阈值，避免相近二维码被过滤
     
     target_locked = False
     target_box = None
@@ -132,25 +131,56 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
         detections = results.pred[0]
         detections = detections[detections[:, 4] >= 0.7]
         
-        # 多二维码画框
+        # ✅ 修正1：多二维码画框（不同颜色+编号，避免重叠）
+        all_qr_data = []  # 存储所有二维码的坐标数据
         for idx, (*xyxy, conf, cls) in enumerate(detections):
             x1, y1, x2, y2 = map(int, xyxy)
+            qr_id = idx + 1  # 二维码编号从1开始
+            
+            # 不同颜色区分：跟踪目标用红色粗框，其他用蓝色细框
             if target_locked and target_box is not None and calculate_iou(target_box, xyxy) >= uav_state.iou_threshold:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                label = f'Tracking QR{idx+1}: {conf:.2f}'
+                color = (0, 0, 255)  # 红色=跟踪目标
+                thickness = 3
+                label = f'Tracking QR{qr_id}: {conf:.2f}'
             else:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f'QR{idx+1}: {conf:.2f}'
-            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                color = (255, 0, 0)  # 蓝色=普通检测
+                thickness = 2
+                label = f'QR{qr_id}: {conf:.2f}'
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            # 标签位置错开，避免重叠
+            cv2.putText(frame, label, (x1, y1 - 10 - idx*15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # 计算该二维码的相对坐标
+            W_qr = x2 - x1
+            cx_qr = (x1 + x2) / 2
+            cy_qr = (y1 + y2) / 2
+            cx_img = W_img / 2
+            cy_img = H_img / 2
+            
+            dz_rel = k * (W_real * f_x) / W_qr
+            dx_pix = cx_qr - cx_img
+            dy_pix = cy_qr - cy_img
+            dx_rel = (dx_pix / f_x) * dz_rel
+            dy_rel = (dy_pix / f_y) * dz_rel
+            
+            # 存储所有二维码数据
+            all_qr_data.append({
+                'id': qr_id,
+                'dx': dx_rel,
+                'dy': dy_rel,
+                'dz': dz_rel,
+                'box': xyxy
+            })
         
-        # 单目标跟踪逻辑
+        # 单目标跟踪逻辑（保留，只跟踪第一个锁定的目标）
         if uav_state.exec_state == 0:
             if len(detections) > 0:
                 target_box = detections[0][:4].tolist()
                 target_locked = True
                 uav_state.is_detected = True
                 uav_state.exec_state = 1
-                print(f"[UAV{uav_id}] 下视追踪：锁定目标二维码")
+                print(f"[UAV{uav_id}] 下视追踪：锁定目标QR1")
             else:
                 if not hasattr(qr_code_detection, f'last_wait_print_{uav_id}') or rospy.Time.now().to_sec() - getattr(qr_code_detection, f'last_wait_print_{uav_id}') > 30:
                     print(f"[UAV{uav_id}] 下视追踪：等待目标二维码...")
@@ -171,69 +201,36 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
                     uav_state.num_count_vision_lost += 1
                     if uav_state.num_count_vision_lost > uav_state.VISION_THRES:
                         uav_state.exec_state = 2
-                        print(f"[UAV{uav_id}] 下视追踪：丢失目标二维码")
-                else:
-                    uav_state.num_count_vision_lost = 0
-                    x1, y1, x2, y2 = map(int, target_box)
-                    W_qr = x2 - x1
-                    cx_qr = (x1 + x2) / 2
-                    cy_qr = (y1 + y2) / 2
-                    cx_img = W_img / 2
-                    cy_img = H_img / 2
-                    
-                    # ✅ 核心修正：纯视觉计算相对坐标（完全不依赖odom）
-                    # 1. 计算无人机距离二维码的高度（通过二维码像素宽度）
-                    dz_rel = k * (W_real * f_x) / W_qr  # 相对高度（无人机在二维码上方dz_rel米）
-                    # 2. 计算二维码相对于无人机的平面偏移
-                    dx_pix = cx_qr - cx_img
-                    dy_pix = cy_qr - cy_img
-                    dx_rel = (dx_pix / f_x) * dz_rel  # 相对x偏移（无人机前为正）
-                    dy_rel = (dy_pix / f_y) * dz_rel  # 相对y偏移（无人机右为正）
-                    
-                    # 标注相对坐标（这才是你需要的控制用坐标）
-                    label = f'Rel: dx={dx_rel:.2f}m, dy={dy_rel:.2f}m, H={dz_rel:.2f}m'
-                    cv2.putText(frame, label, (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            
+                        print(f"[UAV{uav_id}] 下视追踪：丢失目标")
             else:
                 uav_state.num_count_vision_lost += 1
                 if uav_state.num_count_vision_lost > uav_state.VISION_THRES:
                     uav_state.exec_state = 2
-                    print(f"[UAV{uav_id}] 下视追踪：丢失目标二维码")
+                    print(f"[UAV{uav_id}] 下视追踪：丢失目标")
         
         elif uav_state.exec_state == 2:
             if len(detections) > 0:
                 target_box = detections[0][:4].tolist()
                 uav_state.exec_state = 1
-                print(f"[UAV{uav_id}] 下视追踪：重新锁定目标二维码")
+                print(f"[UAV{uav_id}] 下视追踪：重新锁定目标QR1")
         
-        # ✅ 核心修正：发布二维码坐标（无定位时为相对初始位置的坐标）
+        # ✅ 修正2：发布所有二维码的坐标（遍历所有检测到的二维码）
         qr_global_poses = PoseArray()
         qr_global_poses.header.stamp = rospy.Time.now()
         qr_global_poses.header.frame_id = "map"
         qr_ids = Int32MultiArray()
         
-        for idx, (*xyxy, conf, cls) in enumerate(detections):
-            x1, y1, x2, y2 = map(int, xyxy)
-            W_qr = x2 - x1
-            cx_qr = (x1 + x2) / 2
-            cy_qr = (y1 + y2) / 2
-            cx_img = W_img / 2
-            cy_img = H_img / 2
+        for qr in all_qr_data:
+            dx_rel = qr['dx']
+            dy_rel = qr['dy']
+            dz_rel = qr['dz']
             
-            # 纯视觉计算相对坐标
-            dz_rel = k * (W_real * f_x) / W_qr
-            dx_pix = cx_qr - cx_img
-            dy_pix = cy_qr - cy_img
-            dx_rel = (dx_pix / f_x) * dz_rel
-            dy_rel = (dy_pix / f_y) * dz_rel
-            
-            # 转换为全局坐标（无定位时，无人机初始位置为(0,0,0)，所以全局坐标=相对坐标）
+            # 转换为全局坐标
             cos_yaw = np.cos(uav_state.drone_global_yaw)
             sin_yaw = np.sin(uav_state.drone_global_yaw)
-            # 下视坐标系转换：相对坐标转全局坐标
             qr_global_x = uav_state.drone_global_x + dx_rel * cos_yaw - dy_rel * sin_yaw
             qr_global_y = uav_state.drone_global_y + dx_rel * sin_yaw + dy_rel * cos_yaw
-            qr_global_z = uav_state.drone_global_z - dz_rel  # 二维码在无人机下方，所以z更小
+            qr_global_z = uav_state.drone_global_z - dz_rel
             
             # 构造消息
             qr_pose = Pose()
@@ -243,17 +240,18 @@ def qr_code_detection(uav_id, uav_state, shared_array, lock):
             qr_pose.orientation.w = 1.0
             
             qr_global_poses.poses.append(qr_pose)
-            qr_ids.data.append(idx+1)
+            qr_ids.data.append(qr['id'])
         
         qr_poses_pub.publish(qr_global_poses)
         qr_ids_pub.publish(qr_ids)
         
-        # 调试信息：打印相对坐标（更直观）
-        if len(detections) > 0 and rospy.Time.now().to_sec() % 5 < 0.1:
-            print(f"\n[UAV{uav_id}] 下视检测到{len(detections)}个二维码")
-            print(f"二维码相对无人机坐标：dx={dx_rel:.2f}m, dy={dy_rel:.2f}m, 高度差={dz_rel:.2f}m")
-            if uav_state.drone_global_z != 0:
-                print(f"无人机全局高度：{uav_state.drone_global_z:.2f}m | 二维码全局z：{qr_global_z:.2f}m")
+        # ✅ 修正3：打印所有二维码的坐标（每2秒一次，避免刷屏）
+        if len(detections) > 0 and rospy.Time.now().to_sec() % 2 < 0.1:
+            print(f"\n[UAV{uav_id}] ======================================")
+            print(f"检测到 {len(detections)} 个二维码：")
+            for qr in all_qr_data:
+                print(f"  QR{qr['id']}: dx={qr['dx']:.2f}m, dy={qr['dy']:.2f}m, 高度差={qr['dz']:.2f}m")
+            print("======================================")
         
         cv2.imshow(detection_window_name, frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
